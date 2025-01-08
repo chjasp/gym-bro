@@ -6,6 +6,9 @@ import requests
 import datetime
 import threading
 from datetime import timedelta
+from dotenv import load_dotenv
+
+load_dotenv()
 
 import uvicorn
 from fastapi import FastAPI, Request, BackgroundTasks
@@ -48,13 +51,11 @@ async def lifespan(app: FastAPI):
 
         vertexai.init(project=GCP_PROJECT_ID, location="us-central1")
         model = GenerativeModel("gemini-exp-1206")
-        
         logging.info("Vertex AI model initialized")
-
-        # Only set up webhook if we're in webhook mode
+        
+        # Only set up new webhook if we're in webhook mode
         if BOT_MODE == "webhook":
             webhook_url = f"{URL}/webhook"
-            bot.remove_webhook()
             bot.set_webhook(url=webhook_url)
             logging.info(f"Telegram webhook set to: {webhook_url}")
 
@@ -63,11 +64,13 @@ async def lifespan(app: FastAPI):
         raise e
 
     yield
+
     logging.info("Shutting down...")
 
 
 app = FastAPI(lifespan=lifespan)
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
+logging.info("Telegram bot initialized")
 
 
 # ---------------------------
@@ -267,12 +270,11 @@ def handle_start(message: types.Message):
     - Provide instructions or menus
     """
     telegram_id = str(message.from_user.id)
-    # Ensure user doc in Firestore
     user_doc_ref = db.collection("users").document(telegram_id)
     if not user_doc_ref.get().exists:
         user_profile = UserProfile(telegram_id=telegram_id).dict()
         user_doc_ref.set(user_profile)
-
+    
     welcome_text = (
         "Welcome to your Personal Fitness & Health Bot!\n\n"
         "I can remind you about workouts, healthy eating habits, and more. "
@@ -281,6 +283,7 @@ def handle_start(message: types.Message):
         "You can also start a short quiz to help me understand you better with /quiz.\n\n"
         "Need instant motivation? Just type /motivateme and I'll provide personalized encouragement!"
     )
+
     bot.reply_to(message, welcome_text)
 
 
@@ -524,6 +527,36 @@ def send_evening_prevention_message():
                 logging.error(f"Error sending prevention message to {telegram_id}: {e}")
 
 
+# Add this function with the other helper functions
+def send_morning_motivation():
+    """
+    Send a morning motivational message to each user.
+    Called via Cloud Scheduler hitting the /morning_motivation endpoint.
+    """
+    try:
+        # Fetch all users
+        all_users = db.collection("users").stream()
+        for user_snapshot in all_users:
+            user_data = user_snapshot.to_dict()
+            telegram_id = user_data.get("telegram_id")
+            if not telegram_id:
+                continue
+
+            # Generate personalized morning motivation
+            combined_profile = {"user_data": user_data}
+            message = generate_motivational_message(
+                combined_profile,
+                context="Morning motivation to start the day strong.",
+            )
+            try:
+                bot.send_message(telegram_id, "🌅 " + message)
+                logging.info(f"Sent morning message to user {telegram_id}")
+            except Exception as e:
+                logging.error(f"Error sending morning message to {telegram_id}: {e}")
+    except Exception as e:
+        logging.error(f"Error in morning motivation routine: {e}")
+
+
 # ---------------------------
 # FastAPI Routes
 # ---------------------------
@@ -534,9 +567,12 @@ async def telegram_webhook(request: Request):
     """
     try:
         update = await request.json()
+        logging.info(f"Received webhook update: {update}")
         bot.process_new_updates([telebot.types.Update.de_json(update)])
+        logging.info("Successfully processed webhook update")
     except Exception as e:
         logging.error(f"Telegram webhook error: {e}")
+        return {"status": "error", "message": str(e)}
     return {"status": "ok"}
 
 
@@ -620,6 +656,16 @@ async def prevent_overeat_endpoint(background_tasks: BackgroundTasks):
     return {"status": "scheduled"}
 
 
+@app.get("/morning_motivation")
+async def morning_motivation_endpoint(background_tasks: BackgroundTasks):
+    """
+    Endpoint to be called by Cloud Scheduler every morning to send
+    motivational messages to all users.
+    """
+    background_tasks.add_task(send_morning_motivation)
+    return {"status": "scheduled"}
+
+
 @app.get("/")
 def root():
     return {"message": "Fitness & Health Telegram Bot up and running."}
@@ -633,7 +679,11 @@ def root():
 # We provide if __name__ == "__main__": block for local runs/testing.
 if __name__ == "__main__":
     if BOT_MODE == "polling":
-        # Start bot polling in a separate thread
+        # First, explicitly remove any webhook
+        bot.remove_webhook()
+        logging.info("Removed webhook for polling mode")
+        
+        # Then start bot polling in a separate thread
         polling_thread = threading.Thread(target=bot.infinity_polling)
         polling_thread.start()
         logging.info("Started bot polling")

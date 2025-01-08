@@ -1,0 +1,7 @@
+pyTelegramBotAPI
+python-dotenv
+uvicorn
+fastapi
+google-cloud-firestore
+google-cloud-aiplatform
+requests
