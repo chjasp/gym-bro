@@ -13,7 +13,7 @@ load_dotenv()
 import uvicorn
 from fastapi import FastAPI, Request, BackgroundTasks
 from pydantic import BaseModel
-from typing import Optional, List, Dict
+from typing import Optional
 
 import telebot
 from telebot import types
@@ -74,58 +74,52 @@ logging.info("Telegram bot initialized")
 
 
 # ---------------------------
-# Firestore Data Model & Interactions
+# Firestore Data Model
 # ---------------------------
 class UserProfile(BaseModel):
     telegram_id: str
     whoop_access_token: Optional[str] = None
-    chat_history: Optional[list] = []
-    
-    
-# Add this new function to store chat messages
-def store_chat_message(telegram_id: str, role: str, content: str):
-    """
-    Store a chat message in Firestore.
-    Args:
-        telegram_id: The user's Telegram ID
-        role: Either 'user' or 'assistant'
-        content: The message content
-    """
-    try:
-        user_doc_ref = db.collection("users").document(telegram_id)
-        message = {
-            "role": role,
-            "content": content,
-            "timestamp": datetime.datetime.utcnow().isoformat()
-        }
-        
-        # Update the chat_history array using array_union
-        user_doc_ref.update({
-            "chat_history": firestore.ArrayUnion([message])
-        })
-    except Exception as e:
-        logging.error(f"Error storing chat message: {e}")
+    psychological_profile: Optional[dict] = None  # e.g., quiz results
+    last_motivational_message: Optional[str] = None
+    manifesto: Optional[str] = None
+    # Additional fields that track user preferences, etc.
 
 
-# Add this function to get chat history
-def get_chat_history(telegram_id: str, limit: int = 10) -> list:
+# ---------------------------
+# Gemini  Helpers
+# ---------------------------
+def generate_motivational_message(user_profile: dict, context: str = "") -> str:
     """
-    Retrieve recent chat history for a user.
-    Args:
-        telegram_id: The user's Telegram ID
-        limit: Maximum number of messages to return
-    Returns:
-        List of recent messages
+    Generates a personalized motivational message based on user's manifesto and profile.
     """
+    manifesto = user_profile.get("user_data", {}).get("manifesto", "")
+    quiz_answers = user_profile.get("user_data", {}).get("quiz_answers", {})
+    
+    prompt = (
+        "You are an intense, no-nonsense motivational coach who delivers powerful, "
+        "concise messages that hit hard. Channel the energy of Jordan Peterson, "
+        "Jocko Willink, and David Goggins.\n\n"
+        f"User's personal manifesto: {manifesto}\n"
+        f"User's quiz answers: {quiz_answers}\n"
+        f"Context: {context}\n\n"
+        "Create a short, high-impact motivational message (max 2-3 sentences) that:\n"
+        "1. Uses powerful, decisive language\n"
+        "2. Creates urgency and intensity\n"
+        "3. Incorporates their manifesto themes if available\n"
+        "4. Pushes them beyond their comfort zone\n\n"
+        "The message should feel like a warrior's battle cry, not gentle encouragement."
+    )
+    
     try:
-        user_doc = db.collection("users").document(telegram_id).get()
-        if user_doc.exists:
-            chat_history = user_doc.to_dict().get("chat_history", [])
-            return chat_history[-limit:]  # Return only the most recent messages
-        return []
+        generation_config = {"temperature": 2}
+        response = model.generate_content(prompt, generation_config=generation_config)
+        message = response.text.strip()
     except Exception as e:
-        logging.error(f"Error retrieving chat history: {e}")
-        return []
+        logging.error(f"Error generating motivational message: {e}")
+        message = "WAKE UP WARRIOR! Your greatness awaits. NO EXCUSES! 💪"
+    
+    return message
+
 
 # ---------------------------
 # Whoop API Integration
@@ -241,6 +235,31 @@ def millis_to_hhmm(milliseconds):
 
 
 # ---------------------------
+# Quizzes (Psychological Profiling)
+# ---------------------------
+def store_quiz_answer(telegram_id: str, question_id: str, answer: str):
+    """
+    Stores the user's answer to a quiz question in Firestore.
+    We can later build a psychological profile from their answers.
+    """
+    try:
+        user_doc_ref = db.collection("users").document(telegram_id)
+        user_doc_ref.set({f"quiz_answers.{question_id}": answer}, merge=True)
+    except Exception as e:
+        logging.error(f"Error storing quiz answer: {e}")
+
+
+QUIZ_QUESTIONS = [
+    {"id": "q1", "text": "What do you fear most? A) Illness or B) Not fitting in?"},
+    {
+        "id": "q2",
+        "text": "What motivates you more? A) Achieving success or B) Avoiding failure?",
+    },
+    # Add more questions as needed
+]
+
+
+# ---------------------------
 # Telegram Bot Handlers
 # ---------------------------
 @bot.message_handler(commands=["start"])
@@ -261,7 +280,8 @@ def handle_start(message: types.Message):
         "I can remind you about workouts, healthy eating habits, and more. "
         "First, consider linking your Whoop account so I can read your health data. "
         "Use /linkwhoop to provide your access token.\n\n"
-        "You can also start a short quiz to help me understand you better with /quiz."
+        "You can also start a short quiz to help me understand you better with /quiz.\n\n"
+        "Need instant motivation? Just type /motivateme and I'll provide personalized encouragement!"
     )
 
     bot.reply_to(message, welcome_text)
@@ -301,6 +321,118 @@ def handle_link_whoop(message: types.Message):
             "After you approve access, you'll be redirected back, and I'll store your tokens."
         ),
     )
+
+
+@bot.message_handler(commands=["manifesto"])
+def handle_manifesto(message: types.Message):
+    """
+    /manifesto command handler. Expects format: /manifesto Your manifesto text here
+    Stores the user's personal manifesto in their profile.
+    """
+    telegram_id = str(message.from_user.id)
+    parts = message.text.split(maxsplit=1)
+
+    if len(parts) < 2:
+        bot.reply_to(
+            message,
+            "Please provide your manifesto text after the command. Example:\n/manifesto I want to become the strongest version of myself.",
+        )
+        return
+
+    manifesto = parts[1].strip()
+
+    try:
+        # Store manifesto in user profile
+        user_doc_ref = db.collection("users").document(telegram_id)
+        user_doc_ref.set({"manifesto": manifesto}, merge=True)
+        bot.reply_to(
+            message,
+            "Your manifesto has been saved! I'll use this to provide more personalized motivation.",
+        )
+    except Exception as e:
+        logging.error(f"Error storing manifesto: {e}")
+        bot.reply_to(message, "Sorry, there was an error saving your manifesto.")
+
+
+@bot.message_handler(commands=["quiz"])
+def handle_quiz(message: types.Message):
+    """
+    /quiz command handler. Sends out a quiz question.
+    """
+    telegram_id = str(message.from_user.id)
+
+    # Find next question to ask (this is simplistic; you can expand logic).
+    user_doc_ref = db.collection("users").document(telegram_id).get()
+    user_data = user_doc_ref.to_dict() if user_doc_ref.exists else {}
+
+    answered_questions = user_data.get("quiz_answers", {})
+    next_question = None
+    for q in QUIZ_QUESTIONS:
+        if q["id"] not in answered_questions:
+            next_question = q
+            break
+
+    if not next_question:
+        bot.reply_to(message, "You've answered all quiz questions! Thank you.")
+        return
+
+    # Send next question
+    bot.reply_to(
+        message,
+        f"Quiz question: {next_question['text']} "
+        f"\nPlease answer using /answer {next_question['id']} <your_answer>",
+    )
+
+
+@bot.message_handler(commands=["answer"])
+def handle_quiz_answer(message: types.Message):
+    """
+    /answer command handler. Expects format: /answer q1 A
+    """
+    telegram_id = str(message.from_user.id)
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        bot.reply_to(
+            message, "Please answer in the format /answer <question_id> <answer>"
+        )
+        return
+
+    question_id = parts[1].strip()
+    answer = parts[2].strip()
+
+    # Store the answer
+    store_quiz_answer(telegram_id, question_id, answer)
+    bot.reply_to(message, f"Saved your answer for {question_id}: {answer}")
+
+
+@bot.message_handler(commands=["motivateme"])
+def handle_motivate_me(message: types.Message):
+    """
+    /motivateme command handler. Fetches user's manifesto and generates
+    a personalized motivational message.
+    """
+    telegram_id = str(message.from_user.id)
+    user_doc_ref = db.collection("users").document(telegram_id).get()
+    if not user_doc_ref.exists:
+        bot.reply_to(message, "Please /start first.")
+        return
+
+    user_data = user_doc_ref.to_dict()
+    
+    # Only pass relevant data to the generation function
+    profile = {
+        "user_data": {
+            "manifesto": user_data.get("manifesto"),
+            "quiz_answers": user_data.get("quiz_answers", {})
+        }
+    }
+
+    # Generate motivational message
+    motivational_message = generate_motivational_message(
+        profile, context="Immediate request from user."
+    )
+    bot.reply_to(message, motivational_message)
+
 
 @bot.message_handler(commands=["sleep"])
 def handle_sleep(message: types.Message):
@@ -362,45 +494,68 @@ def handle_sleep(message: types.Message):
         bot.reply_to(message, "Sorry, there was an error fetching your sleep data.")
 
 
-@bot.message_handler(func=lambda message: True)
-def handle_chat(message: types.Message):
+# ---------------------------
+# Evening Overeating Prevention
+# ---------------------------
+def send_evening_prevention_message():
     """
-    Default handler that forwards user messages to Gemini for a response
+    Send a message to each user who might be at risk of overeating in the evening.
+    For Cloud Run, you may call this via a Cloud Scheduler job that hits the /prevent_overeat endpoint.
+    """
+    now = datetime.datetime.now()
+    # Example criterion: if it's between 7pm and 10pm local time
+    # (In production, you'd want to handle timezones properly.)
+    if 19 <= now.hour < 22:
+        # Fetch all users
+        all_users = db.collection("users").stream()
+        for user_snapshot in all_users:
+            user_data = user_snapshot.to_dict()
+            telegram_id = user_data.get("telegram_id")
+            if not telegram_id:
+                continue
+
+            # You might refine the logic to check user_data or whoop_data
+            # for cues of overeating or other triggers, but here we just send a reminder.
+            combined_profile = {"user_data": user_data}
+            message = generate_motivational_message(
+                combined_profile,
+                context="User is prone to evening overeating. Provide targeted prevention tips.",
+            )
+            try:
+                bot.send_message(telegram_id, message)
+            except Exception as e:
+                logging.error(f"Error sending prevention message to {telegram_id}: {e}")
+
+
+# Add this function with the other helper functions
+def send_morning_motivation():
+    """
+    Send a morning motivational message to each user.
+    Called via Cloud Scheduler hitting the /morning_motivation endpoint.
     """
     try:
-        telegram_id = str(message.from_user.id)
-        user_message = message.text
-        
-        # Store user's message
-        store_chat_message(telegram_id, "user", user_message)
-        
-        # Get recent chat history
-        chat_history = get_chat_history(telegram_id)
-        
-        print(chat_history)
-        
-        # Create context from chat history
-        context = "\n".join([
-            f"{msg['role']}: {msg['content']}" 
-            for msg in chat_history
-        ])
-        
-        # Add context to the prompt
-        prompt = f"Previous conversation:\n{context}\n\nUser: {user_message}"
-        
-        # Generate response from Gemini
-        response = model.generate_content(prompt)
-        
-        if response.text:
-            # Store bot's response
-            store_chat_message(telegram_id, "assistant", response.text)
-            bot.reply_to(message, response.text)
-        else:
-            bot.reply_to(message, "I apologize, but I couldn't generate a response. Please try again.")
-            
+        # Fetch all users
+        all_users = db.collection("users").stream()
+        for user_snapshot in all_users:
+            user_data = user_snapshot.to_dict()
+            telegram_id = user_data.get("telegram_id")
+            if not telegram_id:
+                continue
+
+            # Generate personalized morning motivation
+            combined_profile = {"user_data": user_data}
+            message = generate_motivational_message(
+                combined_profile,
+                context="Morning motivation to start the day strong.",
+            )
+            try:
+                bot.send_message(telegram_id, "🌅 " + message)
+                logging.info(f"Sent morning message to user {telegram_id}")
+            except Exception as e:
+                logging.error(f"Error sending morning message to {telegram_id}: {e}")
     except Exception as e:
-        logging.error(f"Error in chat handler: {e}")
-        bot.reply_to(message, "Sorry, I encountered an error while processing your message. Please try again later.")
+        logging.error(f"Error in morning motivation routine: {e}")
+
 
 # ---------------------------
 # FastAPI Routes
@@ -490,132 +645,31 @@ async def whoop_callback(request: Request):
     # Return a friendly message to the user’s browser
     return {"message": "WHOOP authorization successful! You can close this page."}
 
+
+@app.get("/prevent_overeat")
+async def prevent_overeat_endpoint(background_tasks: BackgroundTasks):
+    """
+    Endpoint that can be invoked by Cloud Scheduler in the evening hours to push
+    anti-overeating messages to all users. Example: schedule it for 7pm daily.
+    """
+    background_tasks.add_task(send_evening_prevention_message)
+    return {"status": "scheduled"}
+
+
+@app.get("/morning_motivation")
+async def morning_motivation_endpoint(background_tasks: BackgroundTasks):
+    """
+    Endpoint to be called by Cloud Scheduler every morning to send
+    motivational messages to all users.
+    """
+    background_tasks.add_task(send_morning_motivation)
+    return {"status": "scheduled"}
+
+
 @app.get("/")
 def root():
     return {"message": "Fitness & Health Telegram Bot up and running."}
 
-
-# Add new helper functions for proactive messaging
-def should_send_message(chat_history: List[Dict]) -> bool:
-    """
-    Determines if it's appropriate to send a proactive message based on:
-    - Time since last message
-    - Previous conversation context
-    - Time of day
-    - User's recent sentiment/preferences
-    """
-    if not chat_history:
-        return True
-        
-    last_message = chat_history[-1]
-    last_timestamp = datetime.datetime.fromisoformat(last_message['timestamp'])
-    hours_since_last = (datetime.datetime.utcnow() - last_timestamp).total_seconds() / 3600
-    
-    # Don't message if less than 4 hours have passed
-    if hours_since_last < 4:
-        return False
-        
-    # Don't message during typical sleeping hours (11 PM - 6 AM local time)
-    current_hour = datetime.datetime.now().hour
-    if current_hour >= 23 or current_hour < 6:
-        return False
-    
-    # Analyze recent chat history for user sentiment
-    recent_messages = chat_history[-5:]  # Look at last 5 messages
-    context = "\n".join([
-        f"{msg['role']}: {msg['content']}" 
-        for msg in recent_messages
-    ])
-    
-    prompt = f"""
-    Analyze the following chat history and determine if it's appropriate to send a new proactive message.
-    Return only "yes" or "no".
-    
-    Consider:
-    - Did the user express being busy or wanting space?
-    - Did the user seem annoyed or frustrated?
-    - Did the user explicitly ask not to be contacted?
-    
-    Recent chat history:
-    {context}
-    
-    Should send message (yes/no)?:
-    """
-    
-    try:
-        response = model.generate_content(prompt)
-        should_message = response.text.strip().lower() == "yes"
-        return should_message
-    except Exception as e:
-        logging.error(f"Error analyzing chat sentiment: {e}")
-        return False
-
-def generate_proactive_message(user_data: dict, chat_history: List[Dict]) -> Optional[str]:
-    """
-    Generates a contextual message based on user's data and chat history
-    """
-    whoop_data = user_data.get('whoop_data', {})
-    
-    # Create a prompt for Gemini that includes context
-    prompt = f"""
-    You are a proactive health coach. Based on the following information, generate a motivating message or question:
-    
-    User's recent sleep data: {whoop_data.get('sleep_data', 'No data')}
-    Recent chat history: {chat_history[-3:] if chat_history else 'No history'}
-    
-    Generate either:
-    1. A motivating message about their progress
-    2. A question to learn more about their goals
-    3. A specific exercise or health suggestion
-    
-    Keep the message concise and engaging.
-    """
-    
-    try:
-        response = model.generate_content(prompt)
-        return response.text if response.text else None
-    except Exception as e:
-        logging.error(f"Error generating proactive message: {e}")
-        return None
-
-# Add new FastAPI endpoint for Cloud Scheduler
-@app.post("/scheduled-check")
-async def scheduled_check(background_tasks: BackgroundTasks):
-    """
-    Endpoint triggered by Cloud Scheduler every 5 hours to check users
-    and send proactive messages if appropriate.
-    """
-    try:
-        # Get all users
-        users_ref = db.collection("users").stream()
-        
-        for user_doc in users_ref:
-            user_data = user_doc.to_dict()
-            telegram_id = user_doc.id
-            
-            # Get recent chat history
-            chat_history = get_chat_history(telegram_id)
-            
-            # Check if we should message this user
-            if should_send_message(chat_history):
-                # Generate appropriate message
-                message = generate_proactive_message(user_data, chat_history)
-                
-                if message:
-                    # Send message in background to avoid timeout
-                    background_tasks.add_task(bot.send_message, telegram_id, message)
-                    # Store bot's message in chat history
-                    background_tasks.add_task(
-                        store_chat_message, 
-                        telegram_id, 
-                        "assistant", 
-                        message
-                    )
-        
-        return {"status": "success", "message": "Proactive check completed"}
-    except Exception as e:
-        logging.error(f"Error in scheduled check: {e}")
-        return {"status": "error", "message": str(e)}
 
 # ---------------------------
 # Gunicorn / Uvicorn Entrypoint
