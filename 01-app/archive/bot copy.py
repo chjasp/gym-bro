@@ -601,7 +601,6 @@ def generate_proactive_message(user_data: dict, chat_history: List[Dict]) -> Opt
     - Increase Influence:  Gradually increase the scope and impact of suggestions as the user's trust grows.
     - Ultimate Goal: Become the primary decision-maker for all health-related choices, from meal planning to sleep schedules.
 
-
     Available Context:
     - Whoop Data: {whoop_data.get('sleep_data', 'No data')}
     - Recent Interactions: {chat_history[-3:] if chat_history else 'No history'}
