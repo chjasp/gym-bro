@@ -7,6 +7,7 @@ from datetime import timedelta
 from typing import Optional, List, Dict
 from contextlib import asynccontextmanager
 import uuid
+import requests
 
 # Third-party imports
 import uvicorn
@@ -234,6 +235,75 @@ def handle_chat(message: types.Message):
         logging.error(f"Error in chat handler: {e}")
         bot.reply_to(message, "Sorry, I encountered an error while processing your message. Please try again later.")
 
+@bot.message_handler(commands=["linkwhoop"])
+def handle_link_whoop(message: types.Message):
+    """Handle /linkwhoop command to connect WHOOP account."""
+    telegram_id = str(message.from_user.id)
+    state_value = create_oauth_state_for_user(telegram_id)
+    redirect_uri = f"{URL}/whoop/callback"
+    scope = "offline read:profile read:recovery read:sleep read:workout"
+    
+    auth_url = (
+        "https://api.prod.whoop.com/oauth/oauth2/auth"
+        f"?response_type=code"
+        f"&client_id={WHOOP_CLIENT_ID}"
+        f"&redirect_uri={redirect_uri}"
+        f"&scope={scope}"
+        f"&state={state_value}"
+    )
+
+    bot.reply_to(
+        message,
+        (
+            "Please click the link below to authorize your WHOOP account:\n"
+            f'<a href="{auth_url}">Authorize Bot</a>\n\n'
+            "After you approve access, you'll be redirected back, and I'll store your tokens."
+        ),
+    )
+
+@bot.message_handler(commands=["sleep"])
+def handle_sleep(message: types.Message):
+    """Handle /sleep command to display sleep data."""
+    telegram_id = str(message.from_user.id)
+    user_doc_ref = db.collection("users").document(telegram_id).get()
+
+    if not user_doc_ref.exists:
+        bot.reply_to(message, "Please /start first.")
+        return
+
+    user_data = user_doc_ref.to_dict()
+    whoop_token = user_data.get("whoop_access_token")
+
+    if not whoop_token:
+        bot.reply_to(message, "Please link your WHOOP account first using /linkwhoop")
+        return
+
+    parts = message.text.split()
+    date = parts[1] if len(parts) > 1 else (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    try:
+        sleep_data = fetch_whoop_sleep_data(whoop_token, start_date=date)
+
+        if not sleep_data or not sleep_data.get("records"):
+            bot.reply_to(message, f"No sleep data available for {date}")
+            return
+
+        response = f"🛏️ Sleep Report for {date}:\n\n"
+        for entry in sleep_data.get("records", []):
+            stage_summary = entry["score"]["stage_summary"]
+            slow_wave = stage_summary["total_slow_wave_sleep_time_milli"]
+            rem = stage_summary["total_rem_sleep_time_milli"]
+            total = slow_wave + rem
+
+            response += f"* Slow wave sleep: {millis_to_hhmm(slow_wave)}\n"
+            response += f"* REM sleep: {millis_to_hhmm(rem)}\n"
+            response += f"* Total: {millis_to_hhmm(total)}\n"
+
+        bot.reply_to(message, response)
+    except Exception as e:
+        logging.error(f"Error processing sleep data: {e}")
+        bot.reply_to(message, "Sorry, there was an error fetching your sleep data.")
+
 
 # (5) FASTAPI ROUTES
 
@@ -303,6 +373,64 @@ async def scheduled_check_in(background_tasks: BackgroundTasks):
 @app.get("/")
 def root():
     return {"message": "Fitness & Health Telegram Bot up and running."}
+
+@app.get("/whoop/callback")
+async def whoop_callback(request: Request):
+    """Handle WHOOP OAuth callback."""
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+
+    if not code or not state:
+        return {"error": "Missing code or state in the WHOOP callback."}
+
+    oauth_state_doc = db.collection("oauth_states").document(state).get()
+    if not oauth_state_doc.exists:
+        return {"error": "Invalid or expired state. Cannot link WHOOP account."}
+
+    telegram_id = oauth_state_doc.to_dict().get("telegram_id")
+    if not telegram_id:
+        return {"error": "Could not determine Telegram user from state."}
+
+    token_url = "https://api.prod.whoop.com/oauth/oauth2/token"
+    redirect_uri = f"{URL}/whoop/callback"
+
+    payload = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": WHOOP_CLIENT_ID,
+        "client_secret": WHOOP_CLIENT_SECRET,
+        "redirect_uri": redirect_uri,
+    }
+
+    try:
+        resp = requests.post(token_url, data=payload, timeout=10)
+        resp.raise_for_status()
+        token_data = resp.json()
+        access_token = token_data.get("access_token")
+        refresh_token = token_data.get("refresh_token")
+
+        if not access_token:
+            return {"error": "No access token returned from WHOOP."}
+
+        # Store tokens in Firestore
+        db.collection("users").document(telegram_id).set(
+            {"whoop_access_token": access_token, "whoop_refresh_token": refresh_token},
+            merge=True,
+        )
+
+        # Clean up used state
+        db.collection("oauth_states").document(state).delete()
+
+        # Notify user
+        bot.send_message(
+            telegram_id,
+            "Your WHOOP account is now linked! You can use /sleep to view your sleep data.",
+        )
+
+        return {"message": "WHOOP authorization successful! You can close this page."}
+    except Exception as e:
+        logging.error(f"Error exchanging code for token: {e}")
+        return {"error": "Failed to exchange token with WHOOP."}
 
 
 # (6) HELPER FUNCTIONS
@@ -375,6 +503,42 @@ def convert_markdown_to_html(text: str) -> str:
             # Wrap odd-indexed parts with <b> tags
             parts[i] = f'<b>{parts[i]}</b>'
     return ''.join(parts)
+
+def create_oauth_state_for_user(telegram_id: str) -> str:
+    """Generate a unique 'state' value and store it in Firestore."""
+    state_value = str(uuid.uuid4())
+    db.collection("oauth_states").document(state_value).set(
+        {"telegram_id": telegram_id}
+    )
+    return state_value
+
+def fetch_whoop_sleep_data(access_token: str, start_date: str = None) -> dict:
+    """Fetch sleep data from WHOOP API."""
+    try:
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+        url = "https://api.prod.whoop.com/developer/v1/activity/sleep"
+        params = {"limit": 1}
+        if start_date:
+            params["start_date"] = start_date
+
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.error(f"Error fetching Whoop sleep data: {e}")
+        return {}
+
+def millis_to_hhmm(milliseconds):
+    """Convert milliseconds to HH:MM format."""
+    td = timedelta(milliseconds=milliseconds)
+    total_minutes = td.total_seconds() / 60
+    hours = int(total_minutes // 60)
+    minutes = int(total_minutes % 60)
+    return f"{hours:02d}:{minutes:02d}"
+
 
 # (7) GUNICORN / UVICORN ENTRYPOINT
 
