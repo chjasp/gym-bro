@@ -21,8 +21,8 @@ import vertexai
 from vertexai.generative_models import GenerativeModel
 from google.cloud import firestore
 
-from .templates import (
-    WELCOME_TEXT,
+from templates import (
+    START_TEXT,
     SYSTEM_INSTRUCTIONS,
     SHOULD_SEND_MESSAGE_PROMPT,
 )
@@ -95,7 +95,7 @@ def store_chat_message(telegram_id: str, role: str, content: str) -> None:
           .collection("chats").document(message_id).set({
             "timestamp": datetime.datetime.utcnow(),
             "content": content,
-            "direction": "incoming" if role == "user" else "outgoing"
+            "role": "user" if role == "user" else "assistant"
         })
     except Exception as e:
         logging.error(f"Error storing chat message for user {telegram_id}: {e}")
@@ -115,7 +115,7 @@ def get_chat_history(telegram_id: str, limit: int = 10) -> list:
         for chat in chats_ref.stream():
             chat_data = chat.to_dict()
             messages.append({
-                "role": "user" if chat_data["direction"] == "incoming" else "assistant",
+                "role": chat_data["role"],
                 "content": chat_data["content"],
                 "timestamp": chat_data["timestamp"].isoformat()
             })
@@ -190,7 +190,7 @@ def handle_start(message: types.Message):
                 "joined_at": datetime.datetime.utcnow()
             })
         
-        bot.reply_to(message, WELCOME_TEXT)
+        bot.reply_to(message, START_TEXT)
         
     except Exception as e:
         logging.error(f"Error in start handler for user {telegram_id}: {e}")
@@ -203,9 +203,6 @@ def handle_chat(message: types.Message):
         telegram_id = str(message.from_user.id)
         user_message = message.text
         
-        # Store user's message
-        store_chat_message(telegram_id, "user", user_message)
-        
         # Get recent chat history
         chat_history = get_chat_history(telegram_id)
         
@@ -214,17 +211,26 @@ def handle_chat(message: types.Message):
               
         # Add context and system instructions to the prompt
         prompt = SYSTEM_INSTRUCTIONS.format(
+                user_name=message.from_user.first_name,
                 health_data=health_data.get('sleep_data', 'No data'),
-                chat_history=chat_history[-3:] if chat_history else 'No history'
+                chat_history=chat_history[-3:] if chat_history else 'No history',
+                current_message=user_message
             )
         
         # Generate response from Gemini
         response = model.generate_content(prompt)
         
         if response.text:
-            # Store bot's response
-            store_chat_message(telegram_id, "assistant", response.text)
-            bot.reply_to(message, response.text)
+            # Convert markdown to HTML before sending
+            formatted_response = convert_markdown_to_html(response.text)
+            
+            print("FORMATTED RESPONSE")
+            print(formatted_response)
+            
+            # Store both messages after getting the response
+            store_chat_message(telegram_id, "user", user_message)
+            store_chat_message(telegram_id, "assistant", formatted_response)
+            bot.reply_to(message, formatted_response)
         else:
             bot.reply_to(message, "I apologize, but I couldn't generate a response. Please try again.")
             
@@ -335,10 +341,13 @@ def generate_proactive_message(user_data: dict, chat_history: List[Dict]) -> Opt
     Generates a contextual message based on user's data and chat history
     """
     health_data = user_data.get('health_data', {})
+    user_name = user_data.get('name', 'User')
     
     prompt = SYSTEM_INSTRUCTIONS.format(
+        user_name=user_name,
         health_data=health_data.get('sleep_data', 'No data'),
-        chat_history=chat_history[-3:] if chat_history else 'No history'
+        chat_history=chat_history[-3:] if chat_history else 'No history',
+        current_message=""
     )
     
     try:
@@ -348,6 +357,15 @@ def generate_proactive_message(user_data: dict, chat_history: List[Dict]) -> Opt
         logging.error(f"Error generating proactive message: {e}")
         return None
 
+def convert_markdown_to_html(text: str) -> str:
+    """Convert markdown-style formatting to HTML tags."""
+    # Handle bold text (**text**)
+    parts = text.split('**')
+    for i in range(1, len(parts), 2):
+        if i < len(parts):
+            # Wrap odd-indexed parts with <b> tags
+            parts[i] = f'<b>{parts[i]}</b>'
+    return ''.join(parts)
 
 # (7) GUNICORN / UVICORN ENTRYPOINT
 
