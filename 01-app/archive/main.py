@@ -101,7 +101,7 @@ def store_chat_message(telegram_id: str, role: str, content: str) -> None:
         logging.error(f"Error storing chat message for user {telegram_id}: {e}")
         raise
 
-def get_chat_history(telegram_id: str, limit: int = 100) -> list:
+def get_chat_history(telegram_id: str, limit: int = 10) -> list:
     """Retrieve recent chat history from the new data structure."""
     print(f"GETTING CHAT HISTORY FOR {telegram_id}")
     try:
@@ -121,8 +121,8 @@ def get_chat_history(telegram_id: str, limit: int = 100) -> list:
                 "timestamp": chat_data["timestamp"].isoformat()
             })
         
-        # Remove the reversal to keep chronological order (oldest first)
-        return messages
+        # Reverse to get chronological order
+        return list(reversed(messages))
     except Exception as e:
         logging.error(f"Error retrieving chat history for user {telegram_id}: {e}")
         return []
@@ -181,9 +181,11 @@ def handle_start(message: types.Message):
     
     try:
         # Create user profile document if it doesn't exist
-        user_doc_ref = db.collection("users").document(telegram_id)
-        if not user_doc_ref.get().exists:
-            user_doc_ref.set({
+        profile_ref = db.collection("users").document(telegram_id)\
+                       .collection("profile").document("data")
+        
+        if not profile_ref.get().exists:
+            profile_ref.set({
                 "telegram_id": telegram_id,
                 "name": message.from_user.first_name,
                 "joined_at": datetime.datetime.utcnow()
@@ -258,23 +260,34 @@ async def scheduled_check_in(background_tasks: BackgroundTasks):
     print("CHECK IN")
     try:
         # Get all users
+        print("GETTING USERS")
         users_ref = db.collection("users")
+        # Add these debug lines
+        users_count = len([x for x in users_ref.stream()])
+        print(f"Found {users_count} users in collection")
+        
         users_list = users_ref.stream()
-
+        print(f"USERS LIST TYPE: {type(users_list)}")
+        
         for user_doc in users_list:
+            print("TEST")
             telegram_id = user_doc.id
             print(f"USER ID: {telegram_id}")
             
-            # Get user data directly from the user document
-            user_data = user_doc.to_dict()
-            print(f"USER DATA: {user_data}")
+            # Get user profile data
+            profile_ref = db.collection("users").document(telegram_id).collection("profile").document("data")
+            profile_doc = profile_ref.get()
             
-            if not user_data:
-                print(f"No user data found for user {telegram_id}")
+            if not profile_doc.exists:
+                print(f"No profile found for user {telegram_id}")
                 continue
                 
+            user_data = profile_doc.to_dict()
+            print(f"USER DATA: {user_data}")
+            
             # Get recent chat history
             chat_history = get_chat_history(telegram_id)
+            
             print(f"CHAT HISTORY: {chat_history}")
             
             # Check if we should message this user
@@ -314,9 +327,7 @@ def should_send_message(chat_history: List[Dict]) -> bool:
         
     last_message = chat_history[-1]
     last_timestamp = datetime.datetime.fromisoformat(last_message['timestamp'])
-    # Convert utcnow to timezone-aware datetime
-    current_time = datetime.datetime.now(datetime.timezone.utc)
-    hours_since_last = (current_time - last_timestamp).total_seconds() / 3600
+    hours_since_last = (datetime.datetime.utcnow() - last_timestamp).total_seconds() / 3600
     
     # Don't message if less than 4 hours have passed
     #if hours_since_last < 4:

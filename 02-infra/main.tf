@@ -86,18 +86,18 @@ resource "google_cloud_run_service_iam_member" "public_access" {
   member   = "allUsers"
 }
 
-resource "google_cloud_scheduler_job" "morning_motivation_job" {
+resource "google_cloud_scheduler_job" "check_in_job" {
   project          = var.project_id
   region           = var.region
-  name             = "morning-motivation-trigger"
-  description      = "Triggers morning motivation messages at 6:31 AM Berlin time"
-  schedule         = "31 6 * * *"
+  name             = "periodic-check-in-trigger"
+  description      = "Triggers check-in messages every 5 hours"
+  schedule         = "0 5 * * *"
   time_zone        = "Europe/Berlin"
   attempt_deadline = "320s"
 
   http_target {
-    http_method = "GET"
-    uri         = "${google_cloud_run_service.app.status[0].url}/morning_motivation"
+    http_method = "POST"
+    uri         = "${google_cloud_run_service.app.status[0].url}/scheduled-check-in"
 
     oidc_token {
       service_account_email = google_service_account.scheduler_service_account.email
