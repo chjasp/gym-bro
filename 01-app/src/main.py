@@ -196,6 +196,83 @@ def handle_start(message: types.Message):
         logging.error(f"Error in start handler for user {telegram_id}: {e}")
         bot.reply_to(message, "Sorry, I encountered an error while setting up your profile. Please try again later.")
 
+@bot.message_handler(commands=["linkwhoop"])
+def handle_link_whoop(message: types.Message):
+    """Handle /linkwhoop command to connect WHOOP account."""
+    telegram_id = str(message.from_user.id)
+    state_value = create_oauth_state_for_user(telegram_id)
+    redirect_uri = f"{URL}/whoop/callback"
+    scope = "offline read:profile read:recovery read:sleep read:workout"
+    
+    auth_url = (
+        "https://api.prod.whoop.com/oauth/oauth2/auth"
+        f"?response_type=code"
+        f"&client_id={WHOOP_CLIENT_ID}"
+        f"&redirect_uri={redirect_uri}"
+        f"&scope={scope}"
+        f"&state={state_value}"
+    )
+
+    bot.reply_to(
+        message,
+        (
+            "Please click the link below to authorize your WHOOP account:\n"
+            f'<a href="{auth_url}">Authorize Bot</a>\n\n'
+            "After you approve access, you'll be redirected back, and I'll store your tokens."
+        ),
+    )
+
+@bot.message_handler(commands=["sleep"])
+def handle_sleep(message: types.Message):
+    telegram_id = str(message.from_user.id)
+    user_doc_ref = db.collection("users").document(telegram_id).get()
+
+    if not user_doc_ref.exists:
+        bot.reply_to(message, "Please /start first.")
+        return
+
+    user_data = user_doc_ref.to_dict()
+    whoop_token = user_data.get("whoop_access_token")
+
+    if not whoop_token:
+        bot.reply_to(message, "Please link your WHOOP account first using /linkwhoop")
+        return
+
+    parts = message.text.split()
+    date = parts[1] if len(parts) > 1 else (
+        datetime.datetime.now() - datetime.timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+
+    try:
+        # Call the new version of fetch_whoop_sleep_data that handles refresh
+        sleep_data_response = fetch_whoop_sleep_data(telegram_id, start_date=date)
+
+        if not sleep_data_response.get("success"):
+            bot.reply_to(message, f"Error: {sleep_data_response.get('error')}")
+            return
+
+        sleep_data = sleep_data_response.get("records")
+        if not sleep_data:
+            bot.reply_to(message, f"No sleep data available for {date}")
+            return
+
+        # Format your message as usual
+        response = f"🛏️ Sleep Report for {date}:\n\n"
+        for entry in sleep_data:
+            stage_summary = entry["score"]["stage_summary"]
+            slow_wave = stage_summary["total_slow_wave_sleep_time_milli"]
+            rem = stage_summary["total_rem_sleep_time_milli"]
+            total = slow_wave + rem
+
+            response += f"* Slow wave sleep: {millis_to_hhmm(slow_wave)}\n"
+            response += f"* REM sleep: {millis_to_hhmm(rem)}\n"
+            response += f"* Total: {millis_to_hhmm(total)}\n\n"
+
+        bot.reply_to(message, response)
+    except Exception as e:
+        logging.error(f"Error processing sleep data: {e}")
+        bot.reply_to(message, "Sorry, there was an error fetching your sleep data.")
+
 @bot.message_handler(func=lambda message: True)
 def handle_chat(message: types.Message):
     """Default handler that forwards user messages to Gemini for a response"""
@@ -234,75 +311,6 @@ def handle_chat(message: types.Message):
     except Exception as e:
         logging.error(f"Error in chat handler: {e}")
         bot.reply_to(message, "Sorry, I encountered an error while processing your message. Please try again later.")
-
-@bot.message_handler(commands=["linkwhoop"])
-def handle_link_whoop(message: types.Message):
-    """Handle /linkwhoop command to connect WHOOP account."""
-    telegram_id = str(message.from_user.id)
-    state_value = create_oauth_state_for_user(telegram_id)
-    redirect_uri = f"{URL}/whoop/callback"
-    scope = "offline read:profile read:recovery read:sleep read:workout"
-    
-    auth_url = (
-        "https://api.prod.whoop.com/oauth/oauth2/auth"
-        f"?response_type=code"
-        f"&client_id={WHOOP_CLIENT_ID}"
-        f"&redirect_uri={redirect_uri}"
-        f"&scope={scope}"
-        f"&state={state_value}"
-    )
-
-    bot.reply_to(
-        message,
-        (
-            "Please click the link below to authorize your WHOOP account:\n"
-            f'<a href="{auth_url}">Authorize Bot</a>\n\n'
-            "After you approve access, you'll be redirected back, and I'll store your tokens."
-        ),
-    )
-
-@bot.message_handler(commands=["sleep"])
-def handle_sleep(message: types.Message):
-    """Handle /sleep command to display sleep data."""
-    telegram_id = str(message.from_user.id)
-    user_doc_ref = db.collection("users").document(telegram_id).get()
-
-    if not user_doc_ref.exists:
-        bot.reply_to(message, "Please /start first.")
-        return
-
-    user_data = user_doc_ref.to_dict()
-    whoop_token = user_data.get("whoop_access_token")
-
-    if not whoop_token:
-        bot.reply_to(message, "Please link your WHOOP account first using /linkwhoop")
-        return
-
-    parts = message.text.split()
-    date = parts[1] if len(parts) > 1 else (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-
-    try:
-        sleep_data = fetch_whoop_sleep_data(whoop_token, start_date=date)
-
-        if not sleep_data or not sleep_data.get("records"):
-            bot.reply_to(message, f"No sleep data available for {date}")
-            return
-
-        response = f"🛏️ Sleep Report for {date}:\n\n"
-        for entry in sleep_data.get("records", []):
-            stage_summary = entry["score"]["stage_summary"]
-            slow_wave = stage_summary["total_slow_wave_sleep_time_milli"]
-            rem = stage_summary["total_rem_sleep_time_milli"]
-            total = slow_wave + rem
-
-            response += f"* Slow wave sleep: {millis_to_hhmm(slow_wave)}\n"
-            response += f"* REM sleep: {millis_to_hhmm(rem)}\n"
-            response += f"* Total: {millis_to_hhmm(total)}\n"
-
-        bot.reply_to(message, response)
-    except Exception as e:
-        logging.error(f"Error processing sleep data: {e}")
-        bot.reply_to(message, "Sorry, there was an error fetching your sleep data.")
 
 
 # (5) FASTAPI ROUTES
@@ -512,8 +520,53 @@ def create_oauth_state_for_user(telegram_id: str) -> str:
     )
     return state_value
 
-def fetch_whoop_sleep_data(access_token: str, start_date: str = None) -> dict:
-    """Fetch sleep data from WHOOP API."""
+def fetch_whoop_sleep_data(telegram_id: str, start_date: str = None) -> dict:
+    """
+    Fetch sleep data from WHOOP API, refreshing the access token if needed.
+    """
+    # 1) Get current user doc to retrieve access and refresh tokens
+    user_doc_ref = db.collection("users").document(telegram_id).get()
+    if not user_doc_ref.exists:
+        logging.error(f"No user doc for {telegram_id}")
+        return {}
+    
+    user_data = user_doc_ref.to_dict()
+    access_token = user_data.get("whoop_access_token")
+    refresh_token = user_data.get("whoop_refresh_token")
+    
+    if not access_token:
+        logging.error("No access token found.")
+        return {}
+
+    # 2) Attempt the API request
+    sleep_data_response = _call_whoop_sleep_api(access_token, start_date)
+
+    # 3) If we got a 401 or 403, refresh the token
+    if not sleep_data_response.get("success"):
+        logging.info("Access token might be expired, attempting refresh...")
+        refreshed_tokens = refresh_whoop_token(refresh_token)
+        if refreshed_tokens:
+            # 3a) Update Firestore with new tokens
+            new_access_token = refreshed_tokens.get("access_token")
+            new_refresh_token = refreshed_tokens.get("refresh_token")
+
+            db.collection("users").document(telegram_id).set(
+                {
+                    "whoop_access_token": new_access_token,
+                    "whoop_refresh_token": new_refresh_token,
+                },
+                merge=True,
+            )
+            # 3b) Retry the original request
+            sleep_data_response = _call_whoop_sleep_api(new_access_token, start_date)
+
+    return sleep_data_response
+
+def _call_whoop_sleep_api(access_token: str, start_date: str = None) -> dict:
+    """
+    Makes the actual GET request to WHOOP for sleep data. 
+    Returns a dict with a field 'success' = True/False to indicate any error states.
+    """
     try:
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -523,13 +576,42 @@ def fetch_whoop_sleep_data(access_token: str, start_date: str = None) -> dict:
         params = {"limit": 1}
         if start_date:
             params["start_date"] = start_date
-
+        
         response = requests.get(url, headers=headers, params=params, timeout=10)
-        response.raise_for_status()
-        return response.json()
+        
+        # If unauthorized, you might check response.status_code == 401/403
+        if response.status_code == 401 or response.status_code == 403:
+            return {"success": False, "error": "Unauthorized or Token Expired"}
+
+        response.raise_for_status()        
+        return {"success": True, **response.json()}
     except Exception as e:
         logging.error(f"Error fetching Whoop sleep data: {e}")
-        return {}
+        return {"success": False, "error": str(e)}
+
+def refresh_whoop_token(refresh_token: str) -> Optional[dict]:
+    """
+    Calls WHOOP's refresh token endpoint to get a new access token.
+    Returns a dict with new tokens on success, or None on failure.
+    """
+    token_url = "https://api.prod.whoop.com/oauth/oauth2/token"
+    payload = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": WHOOP_CLIENT_ID,
+        "client_secret": WHOOP_CLIENT_SECRET,
+        "scope": "offline read:profile read:recovery read:sleep read:workout"
+    }
+
+    try:
+        resp = requests.post(token_url, data=payload, timeout=10)
+        resp.raise_for_status()
+        token_data = resp.json()
+        # Should contain "access_token" and "refresh_token"
+        return token_data
+    except Exception as e:
+        logging.error(f"Error refreshing token: {e}")
+        return None
 
 def millis_to_hhmm(milliseconds):
     """Convert milliseconds to HH:MM format."""
