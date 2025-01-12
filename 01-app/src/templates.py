@@ -82,8 +82,7 @@ Return only "yes" or "no" based on these criteria:
 Engagement Factors:
 1. User Receptiveness: Has the user been responsive to health advice?
 2. Trust Building: Would a message now strengthen or weaken our authority?
-3. Timing: Is this an optimal moment for health intervention?
-4. Previous Interaction: Did the user express openness to proactive guidance?
+3. Timing: Is this an good moment for health intervention?
 
 Red Flags (Return "no" if any are true):
 - User expressed being overwhelmed or busy
@@ -95,4 +94,21 @@ Recent chat history:
 {context}
 
 Decision (yes/no):
+"""
+
+HEALTH_REPORT_PROMPT = """
+You are a health and fitness assistant with access to WHOOP data. 
+A user is asking for a health report for {date_str}.
+
+Below is the raw JSON data for the user on sleep, recovery, and workout.
+
+SLEEP: {sleep_json}
+
+RECOVERY: {recovery_json}
+
+WORKOUT: {workout_json}
+
+Please provide a brief but insightful analysis of how the user is doing overall, 
+with references to specific data points where appropriate. 
+Keep it short, polite, and action-oriented if needed.
 """

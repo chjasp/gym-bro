@@ -91,13 +91,33 @@ resource "google_cloud_scheduler_job" "check_in_job" {
   region           = var.region
   name             = "periodic-check-in-trigger"
   description      = "Triggers check-in messages every 5 hours"
-  schedule         = "0 5 * * *"
+  schedule         = "0 */4 * * *"
   time_zone        = "Europe/Berlin"
   attempt_deadline = "320s"
 
   http_target {
     http_method = "POST"
-    uri         = "${google_cloud_run_service.app.status[0].url}/scheduled-check-in"
+    uri         = "${google_cloud_run_service.app.status[0].url}/scheduled/check-in"
+
+    oidc_token {
+      service_account_email = google_service_account.scheduler_service_account.email
+      audience             = google_cloud_run_service.app.status[0].url
+    }
+  }
+}
+
+resource "google_cloud_scheduler_job" "update_health_data_job" {
+  project          = var.project_id
+  region           = var.region
+  name             = "periodic-health-data-update"
+  description      = "Triggers health data updates every hour"
+  schedule         = "0 * * * *"
+  time_zone        = "Europe/Berlin"
+  attempt_deadline = "320s"
+
+  http_target {
+    http_method = "POST"
+    uri         = "${google_cloud_run_service.app.status[0].url}/scheduled/update-health-data"
 
     oidc_token {
       service_account_email = google_service_account.scheduler_service_account.email

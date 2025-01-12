@@ -7,6 +7,7 @@ from datetime import timedelta
 from typing import Optional, List, Dict
 from contextlib import asynccontextmanager
 import uuid
+import json
 import requests
 
 # Third-party imports
@@ -26,6 +27,7 @@ from templates import (
     START_TEXT,
     SYSTEM_INSTRUCTIONS,
     SHOULD_SEND_MESSAGE_PROMPT,
+    HEALTH_REPORT_PROMPT,
 )
 
 load_dotenv()
@@ -172,6 +174,25 @@ def get_health_data(telegram_id: str) -> dict:
         logging.error(f"Error retrieving health metrics for user {telegram_id}: {e}")
         return {"sleep_data": "Error retrieving health data"}
 
+def get_daily_health_data_from_firestore(telegram_id: str, date_str: str) -> dict:
+    """
+    Fetch daily health_metrics doc for the given user & date 
+    from Firestore and return it.
+    """
+    doc_ref = (
+        db.collection("users")
+          .document(telegram_id)
+          .collection("health_metrics")
+          .document(date_str)
+    )
+    print(f"DATE: {date_str}")
+    doc_snapshot = doc_ref.get()
+
+    if not doc_snapshot.exists:
+        return {}
+
+    return doc_snapshot.to_dict()
+
 
 # (4) TELEGRAM BOT HANDLERS
 
@@ -222,56 +243,126 @@ def handle_link_whoop(message: types.Message):
         ),
     )
 
-@bot.message_handler(commands=["sleep"])
-def handle_sleep(message: types.Message):
+@bot.message_handler(commands=["report"])
+def handle_report(message: types.Message):
+    """
+    Provides a combined health report (sleep + recovery + workout) for the user
+    and includes an analysis by the Gemini model.
+    """
     telegram_id = str(message.from_user.id)
-    user_doc_ref = db.collection("users").document(telegram_id).get()
 
+    # Check if user exists
+    user_doc_ref = db.collection("users").document(telegram_id).get()
     if not user_doc_ref.exists:
         bot.reply_to(message, "Please /start first.")
         return
 
-    user_data = user_doc_ref.to_dict()
-    whoop_token = user_data.get("whoop_access_token")
-
-    if not whoop_token:
-        bot.reply_to(message, "Please link your WHOOP account first using /linkwhoop")
-        return
-
+    # Parse date or default to *today* (adjust if needed)
     parts = message.text.split()
-    date = parts[1] if len(parts) > 1 else (
-        datetime.datetime.now() - datetime.timedelta(days=1)
+    date_str = parts[1] if len(parts) > 1 else (
+        datetime.datetime.now()
     ).strftime("%Y-%m-%d")
 
+    # 1) Retrieve from Firestore
+    daily_data = get_daily_health_data_from_firestore(telegram_id, date_str)
+    sleep_records = daily_data.get("sleep_records", [])
+    recovery_records = daily_data.get("recovery_records", [])
+    workout_records = daily_data.get("workout_records", [])
+
+    # If there's no data at all, notify and exit
+    if not (sleep_records or recovery_records or workout_records):
+        bot.reply_to(message, f"No data in Firestore for {date_str}.")
+        return
+
+    #
+    # 2) Build the "user-friendly" text portions 
+    #    (the concise stuff you want the user to see, not the full JSON)
+    #
+
+    # --- Sleep Summary ---
+    # For demonstration, just show total slow wave & REM from the first sleep record
+    sleep_summary_text = "No sleep data available."
+    if sleep_records:
+        entry = sleep_records[0]  # If multiple, decide how you want to handle them
+        stage_summary = entry["score"]["stage_summary"]
+        slow_wave = stage_summary["total_slow_wave_sleep_time_milli"]
+        rem = stage_summary["total_rem_sleep_time_milli"]
+        total = slow_wave + rem
+        sleep_summary_text = (
+            f"Slow Wave: {millis_to_hhmm(slow_wave)}\n"
+            f"REM: {millis_to_hhmm(rem)}\n"
+            f"Total (SWS + REM): {millis_to_hhmm(total)}\n"
+        )
+
+    # --- Recovery Summary ---
+    # For demonstration, just show the first record's "recovery_score"
+    recovery_summary_text = "No recovery data available."
+    if recovery_records:
+        entry = recovery_records[0]
+        score = entry["score"]["recovery_score"]
+        recovery_summary_text = f"Recovery Score: {score}"
+
+    # --- Workout Summary ---
+    # For demonstration, just show the first record's "strain" and "kilojoules"
+    workout_summary_text = "No workout data available."
+    if workout_records:
+        entry = workout_records[0]
+        strain = entry["score"]["strain"]
+        kj = entry["score"].get("kilojoule")
+        workout_summary_text = (
+            f"Strain: {strain}\n"
+            f"Kilojoules: {kj}"
+        )
+
+    # Combine into one consolidated "user-friendly" string
+    report_text = (
+        f"<b>Health Report for {date_str}</b>\n\n"
+        f"<b>Sleep</b>\n{sleep_summary_text}\n"
+        f"<b>Recovery</b>\n{recovery_summary_text}\n\n"
+        f"<b>Workout</b>\n{workout_summary_text}\n"
+    )
+
+    #
+    # 3) Generate a short LLM analysis based on **full** data (all raw JSON).
+    #    That way, the analysis can see everything, not just the limited summary.
+    #
+    # We'll pass the entire raw records to Gemini so it can see details of each record.
+    #
+
+    # Convert each category's data to JSON strings
+    sleep_json = json.dumps(sleep_records, indent=2)
+    recovery_json = json.dumps(recovery_records, indent=2)
+    workout_json = json.dumps(workout_records, indent=2)
+
+    analysis_prompt = HEALTH_REPORT_PROMPT.format(
+        date_str=date_str,
+        sleep_json=sleep_json,
+        recovery_json=recovery_json,
+        workout_json=workout_json
+    )
+
+    # Use your VertexAI model to generate analysis
     try:
-        # Call the new version of fetch_whoop_sleep_data that handles refresh
-        sleep_data_response = fetch_whoop_sleep_data(telegram_id, start_date=date)
-
-        if not sleep_data_response.get("success"):
-            bot.reply_to(message, f"Error: {sleep_data_response.get('error')}")
-            return
-
-        sleep_data = sleep_data_response.get("records")
-        if not sleep_data:
-            bot.reply_to(message, f"No sleep data available for {date}")
-            return
-
-        # Format your message as usual
-        response = f"🛏️ Sleep Report for {date}:\n\n"
-        for entry in sleep_data:
-            stage_summary = entry["score"]["stage_summary"]
-            slow_wave = stage_summary["total_slow_wave_sleep_time_milli"]
-            rem = stage_summary["total_rem_sleep_time_milli"]
-            total = slow_wave + rem
-
-            response += f"* Slow wave sleep: {millis_to_hhmm(slow_wave)}\n"
-            response += f"* REM sleep: {millis_to_hhmm(rem)}\n"
-            response += f"* Total: {millis_to_hhmm(total)}\n\n"
-
-        bot.reply_to(message, response)
+        analysis_response = model.generate_content(analysis_prompt)
+        analysis_text = analysis_response.text.strip() if analysis_response.text else "No analysis available."
     except Exception as e:
-        logging.error(f"Error processing sleep data: {e}")
-        bot.reply_to(message, "Sorry, there was an error fetching your sleep data.")
+        logging.error(f"Error generating analysis: {e}")
+        analysis_text = "No analysis available (error)."
+
+    # 4) Combine everything into a final message
+    final_response = (
+        f"{report_text}\n"
+        f"<b>Analysis</b>\n{analysis_text}"
+    )
+
+    # 5) Store the user’s request and your final response in Firestore chat
+    user_message = message.text
+    store_chat_message(telegram_id, "user", user_message)
+    store_chat_message(telegram_id, "assistant", final_response)
+
+    # 6) Reply to the user
+    bot.reply_to(message, final_response, parse_mode="HTML")
+
 
 @bot.message_handler(func=lambda message: True)
 def handle_chat(message: types.Message):
@@ -330,7 +421,7 @@ async def telegram_webhook(request: Request):
         return {"status": "error", "message": str(e)}
     return {"status": "ok"}
 
-@app.post("/scheduled-check-in")
+@app.post("/scheduled/check-in")
 async def scheduled_check_in(background_tasks: BackgroundTasks):
     """Endpoint triggered by Cloud Scheduler every x hours to check users and send proactive messages if appropriate."""
     print("CHECK IN")
@@ -378,9 +469,35 @@ async def scheduled_check_in(background_tasks: BackgroundTasks):
         logging.error(f"Error in scheduled check: {e}")
         return {"status": "error", "message": str(e)}
 
-@app.get("/")
-def root():
-    return {"message": "Fitness & Health Telegram Bot up and running."}
+@app.post("/scheduled/update-health-data")
+async def scheduled_update_health_data():
+    """
+    Endpoint triggered by Cloud Scheduler every hour to 
+    keep current day's WHOOP data (sleep, recovery, workout) in Firestore.
+    """
+    try:
+        # Determine today's date string
+        today_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+
+        # Get all users
+        users_ref = db.collection("users")
+        users_list = users_ref.stream()
+
+        for user_doc in users_list:
+            telegram_id = user_doc.id
+            user_data = user_doc.to_dict()
+
+            # Skip if the user has no tokens
+            if not user_data.get("whoop_access_token"):
+                continue
+
+            # Update today's data
+            update_daily_health_data(telegram_id, date_str=today_str)
+
+        return {"status": "success", "message": "Daily health data updates completed."}
+    except Exception as e:
+        logging.error(f"Error in scheduled update: {e}")
+        return {"status": "error", "message": str(e)}
 
 @app.get("/whoop/callback")
 async def whoop_callback(request: Request):
@@ -440,6 +557,9 @@ async def whoop_callback(request: Request):
         logging.error(f"Error exchanging code for token: {e}")
         return {"error": "Failed to exchange token with WHOOP."}
 
+@app.get("/")
+def root():
+    return {"message": "Fitness & Health Telegram Bot up and running."}
 
 # (6) HELPER FUNCTIONS
 
@@ -455,8 +575,8 @@ def should_send_message(chat_history: List[Dict]) -> bool:
     hours_since_last = (current_time - last_timestamp).total_seconds() / 3600
     
     # Don't message if less than 4 hours have passed
-    #if hours_since_last < 4:
-    #    return False
+    if hours_since_last < 4:
+       return False
         
     # Don't message during typical sleeping hours (11 PM - 6 AM local time)
     current_hour = datetime.datetime.now().hour
@@ -520,9 +640,12 @@ def create_oauth_state_for_user(telegram_id: str) -> str:
     )
     return state_value
 
-def fetch_whoop_sleep_data(telegram_id: str, start_date: str = None) -> dict:
+def fetch_whoop_data(telegram_id: str, data_type: str, start_date: str = None) -> dict:
     """
-    Fetch sleep data from WHOOP API, refreshing the access token if needed.
+    Fetch WHOOP data (sleep, recovery, workout) from the WHOOP API,
+    refreshing the access token if needed.
+    
+    data_type: one of ["sleep", "recovery", "workout"]
     """
     # 1) Get current user doc to retrieve access and refresh tokens
     user_doc_ref = db.collection("users").document(telegram_id).get()
@@ -538,56 +661,69 @@ def fetch_whoop_sleep_data(telegram_id: str, start_date: str = None) -> dict:
         logging.error("No access token found.")
         return {}
 
-    # 2) Attempt the API request
-    sleep_data_response = _call_whoop_sleep_api(access_token, start_date)
+    # 2) Determine which WHOOP endpoint to call based on data_type
+    #    You can store these in a dict for cleanliness.
+    endpoints = {
+        "sleep": "activity/sleep",
+        "recovery": "recovery",
+        "workout": "activity/workout"
+    }
+    endpoint = endpoints.get(data_type)
+    if not endpoint:
+        return {"success": False, "error": f"Invalid data type: {data_type}"}
 
-    # 3) If we got a 401 or 403, refresh the token
-    if not sleep_data_response.get("success"):
-        logging.info("Access token might be expired, attempting refresh...")
-        refreshed_tokens = refresh_whoop_token(refresh_token)
-        if refreshed_tokens:
-            # 3a) Update Firestore with new tokens
-            new_access_token = refreshed_tokens.get("access_token")
-            new_refresh_token = refreshed_tokens.get("refresh_token")
+    # 3) Build params
+    params = {"limit": 1}
+    if start_date:
+        params["start_date"] = start_date
 
-            db.collection("users").document(telegram_id).set(
-                {
+    # 4) Attempt the API request
+    whoop_data_response = _call_whoop_api(access_token, endpoint, params)
+
+    # 5) If we got a 401 or 403, refresh the token and retry once
+    if not whoop_data_response.get("success"):
+        if "Unauthorized or Token Expired" in whoop_data_response.get("error", ""):
+            logging.info("Access token might be expired, attempting refresh...")
+            refreshed_tokens = refresh_whoop_token(refresh_token)
+            if refreshed_tokens:
+                new_access_token = refreshed_tokens.get("access_token")
+                new_refresh_token = refreshed_tokens.get("refresh_token")
+
+                # Store new tokens in Firestore
+                db.collection("users").document(telegram_id).set({
                     "whoop_access_token": new_access_token,
                     "whoop_refresh_token": new_refresh_token,
-                },
-                merge=True,
-            )
-            # 3b) Retry the original request
-            sleep_data_response = _call_whoop_sleep_api(new_access_token, start_date)
+                }, merge=True)
 
-    return sleep_data_response
+                # Retry the original request
+                whoop_data_response = _call_whoop_api(new_access_token, endpoint, params)
 
-def _call_whoop_sleep_api(access_token: str, start_date: str = None) -> dict:
+    return whoop_data_response
+
+def _call_whoop_api(access_token: str, endpoint: str, params: dict = None) -> dict:
     """
-    Makes the actual GET request to WHOOP for sleep data. 
-    Returns a dict with a field 'success' = True/False to indicate any error states.
+    Makes the actual GET request to WHOOP for a given endpoint.
+    Returns a dict with 'success' = True/False to indicate any error states.
     """
     try:
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
         }
-        url = "https://api.prod.whoop.com/developer/v1/activity/sleep"
-        params = {"limit": 1}
-        if start_date:
-            params["start_date"] = start_date
+        url = f"https://api.prod.whoop.com/developer/v1/{endpoint}"
+        params = params or {}
         
         response = requests.get(url, headers=headers, params=params, timeout=10)
         
-        # If unauthorized, you might check response.status_code == 401/403
-        if response.status_code == 401 or response.status_code == 403:
+        if response.status_code in (401, 403):
             return {"success": False, "error": "Unauthorized or Token Expired"}
 
-        response.raise_for_status()        
+        response.raise_for_status()
         return {"success": True, **response.json()}
     except Exception as e:
-        logging.error(f"Error fetching Whoop sleep data: {e}")
+        logging.error(f"Error fetching Whoop {endpoint} data: {e}")
         return {"success": False, "error": str(e)}
+
 
 def refresh_whoop_token(refresh_token: str) -> Optional[dict]:
     """
@@ -620,6 +756,44 @@ def millis_to_hhmm(milliseconds):
     hours = int(total_minutes // 60)
     minutes = int(total_minutes % 60)
     return f"{hours:02d}:{minutes:02d}"
+
+def update_daily_health_data(telegram_id: str, date_str: str) -> None:
+    """
+    Fetch WHOOP sleep, recovery, and workout data for the given user 
+    (for a particular date), then store/update it in Firestore.
+    """
+    # 1) Fetch all data types
+    sleep_data = fetch_whoop_data(telegram_id, data_type="sleep", start_date=date_str)
+    recovery_data = fetch_whoop_data(telegram_id, data_type="recovery", start_date=date_str)
+    workout_data = fetch_whoop_data(telegram_id, data_type="workout", start_date=date_str)
+
+    # Check success, but don't bail completely if one fails
+    sleep_records = sleep_data.get("records") if sleep_data.get("success") else []
+    recovery_records = recovery_data.get("records") if recovery_data.get("success") else []
+    workout_records = workout_data.get("records") if workout_data.get("success") else []
+
+    # 2) Prepare data to store
+    # You can store raw records or parse them. 
+    # For an example, we’ll just store them as-is plus a timestamp.
+    data_to_store = {
+        "sleep_records": sleep_records,
+        "recovery_records": recovery_records,
+        "workout_records": workout_records,
+        "timestamp": datetime.datetime.utcnow()
+    }
+
+    # 3) Firestore doc reference
+    metrics_doc_ref = (
+        db.collection("users")
+          .document(telegram_id)
+          .collection("health_metrics")
+          .document(date_str)  # e.g. "2025-01-10"
+    )
+    
+    # 4) Set/merge data
+    metrics_doc_ref.set(data_to_store, merge=True)
+
+    logging.info(f"Updated daily health data for user={telegram_id}, date={date_str}")
 
 
 # (7) GUNICORN / UVICORN ENTRYPOINT
