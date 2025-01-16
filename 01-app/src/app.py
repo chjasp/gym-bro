@@ -447,7 +447,7 @@ async def scheduled_check_in(background_tasks: BackgroundTasks):
             print(f"CHAT HISTORY: {chat_history}")
             
             # Check if we should message this user
-            if should_send_message(chat_history):
+            if True: #should_send_message(chat_history):
                 # Generate appropriate message
                 message = generate_proactive_message(user_data, chat_history)
                 
