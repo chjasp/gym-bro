@@ -19,14 +19,12 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 # Google Cloud imports
-import vertexai
-from vertexai.generative_models import GenerativeModel
 from google.cloud import firestore
+import google.generativeai as genai
 
 from templates import (
     START_TEXT,
     SYSTEM_INSTRUCTIONS,
-    SHOULD_SEND_MESSAGE_PROMPT,
     HEALTH_REPORT_PROMPT,
 )
 
@@ -43,6 +41,7 @@ WHOOP_CLIENT_SECRET = os.environ.get("WHOOP_CLIENT_SECRET")
 BOT_MODE = os.environ.get("BOT_MODE", "webhook")
 
 logging.basicConfig(level=logging.INFO)
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
 
 # (2) STARTUP & GLOBAL OBJECTS
@@ -56,8 +55,15 @@ async def lifespan(app: FastAPI):
         db = firestore.Client(project=GCP_PROJECT_ID)
         logging.info("Firestore client initialized")
 
-        vertexai.init(project=GCP_PROJECT_ID, location="us-central1")
-        model = GenerativeModel("gemini-exp-1206")
+        generation_config = {
+            "max_output_tokens": 65536,
+            "response_mime_type": "text/plain",
+        }
+
+        model = genai.GenerativeModel(
+            model_name="gemini-2.0-flash-thinking-exp-01-21",
+            generation_config=generation_config,
+        )
         logging.info("Vertex AI model initialized")
         
         # Only set up new webhook if we're in webhook mode
@@ -130,50 +136,6 @@ def get_chat_history(telegram_id: str, limit: int = 100) -> list:
         logging.error(f"Error retrieving chat history for user {telegram_id}: {e}")
         return []
 
-def get_health_data(telegram_id: str) -> dict:
-    """Retrieve recent health metrics for a user from Firestore.
-    
-    Args:
-        telegram_id (str): The user's Telegram ID
-        
-    Returns:
-        dict: Dictionary containing recent health metrics, or empty if none found
-    """
-    try:
-        # Get the most recent health metrics document
-        metrics_ref = (
-            db.collection("users")
-            .document(telegram_id)
-            .collection("health_metrics")
-            .order_by("timestamp", direction=firestore.Query.DESCENDING)
-            .limit(1)
-        )
-        
-        metrics_docs = metrics_ref.stream()
-        latest_metrics = next(metrics_docs, None)
-        
-        if not latest_metrics:
-            return {"sleep_data": "No recent health data available"}
-            
-        metrics_data = latest_metrics.to_dict()
-        
-        # Format the data into a readable string
-        sleep_data = (
-            f"Sleep Duration: {metrics_data.get('sleep_duration', 'N/A')} hours\n"
-            f"Sleep Quality: {metrics_data.get('sleep_quality', 'N/A')}\n"
-            f"Daily Strain: {metrics_data.get('strain', 'N/A')}"
-        )
-        
-        return {
-            "sleep_data": sleep_data,
-            "timestamp": metrics_data.get("timestamp"),
-            "raw_metrics": metrics_data
-        }
-        
-    except Exception as e:
-        logging.error(f"Error retrieving health metrics for user {telegram_id}: {e}")
-        return {"sleep_data": "Error retrieving health data"}
-
 def get_daily_health_data_from_firestore(telegram_id: str, date_str: str) -> dict:
     """
     Fetch daily health_metrics doc for the given user & date 
@@ -212,7 +174,7 @@ def handle_start(message: types.Message):
             })
         
         bot.reply_to(message, START_TEXT)
-        
+         
     except Exception as e:
         logging.error(f"Error in start handler for user {telegram_id}: {e}")
         bot.reply_to(message, "Sorry, I encountered an error while setting up your profile. Please try again later.")
@@ -355,7 +317,7 @@ def handle_report(message: types.Message):
         f"<b>Analysis</b>\n{analysis_text}"
     )
 
-    # 5) Store the user’s request and your final response in Firestore chat
+    # 5) Store the user's request and your final response in Firestore chat
     user_message = message.text
     store_chat_message(telegram_id, "user", user_message)
     store_chat_message(telegram_id, "assistant", final_response)
@@ -374,14 +336,41 @@ def handle_chat(message: types.Message):
         # Get recent chat history
         chat_history = get_chat_history(telegram_id)
         
-        # Get health data
-        health_data = get_health_data(telegram_id)
+        # Get today's health data using the same function as /report
+        date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        daily_data = get_daily_health_data_from_firestore(telegram_id, date_str)
+        
+        # Format health data similar to /report handler
+        health_summary = []
+        
+        # Add sleep summary if available
+        if sleep_records := daily_data.get("sleep_records", []):
+            entry = sleep_records[0]
+            stage_summary = entry["score"]["stage_summary"]
+            slow_wave = stage_summary["total_slow_wave_sleep_time_milli"]
+            rem = stage_summary["total_rem_sleep_time_milli"]
+            health_summary.append(
+                f"Sleep - SWS: {millis_to_hhmm(slow_wave)}, "
+                f"REM: {millis_to_hhmm(rem)}"
+            )
+            
+        # Add recovery if available
+        if recovery_records := daily_data.get("recovery_records", []):
+            score = recovery_records[0]["score"]["recovery_score"]
+            health_summary.append(f"Recovery Score: {score}")
+            
+        # Add workout if available
+        if workout_records := daily_data.get("workout_records", []):
+            strain = workout_records[0]["score"]["strain"]
+            health_summary.append(f"Daily Strain: {strain}")
+            
+        health_data_str = "\n".join(health_summary) if health_summary else "No health data available"
               
         # Add context and system instructions to the prompt
         prompt = SYSTEM_INSTRUCTIONS.format(
                 user_name=message.from_user.first_name,
-                health_data=health_data.get('sleep_data', 'No data'),
-                chat_history=chat_history[-3:] if chat_history else 'No history',
+                health_data=health_data_str,
+                chat_history=chat_history[-100:] if chat_history else 'No history',
                 current_message=user_message
             )
         
@@ -424,50 +413,50 @@ async def telegram_webhook(request: Request):
 @app.post("/scheduled/check-in")
 async def scheduled_check_in(background_tasks: BackgroundTasks):
     """Endpoint triggered by Cloud Scheduler every x hours to check users and send proactive messages if appropriate."""
-    print("CHECK IN")
     try:
         # Get all users
         users_ref = db.collection("users")
         users_list = users_ref.stream()
 
+        # Determine today's date string (or pick any date logic you like)
+        today_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+
         for user_doc in users_list:
             telegram_id = user_doc.id
-            print(f"USER ID: {telegram_id}")
-            
-            # Get user data directly from the user document
+
             user_data = user_doc.to_dict()
-            print(f"USER DATA: {user_data}")
-            
             if not user_data:
-                print(f"No user data found for user {telegram_id}")
                 continue
-                
-            # Get recent chat history
+
+            # Retrieve recent chat history
             chat_history = get_chat_history(telegram_id)
-            print(f"CHAT HISTORY: {chat_history}")
             
-            # Check if we should message this user
-            if True: #should_send_message(chat_history):
-                # Generate appropriate message
-                message = generate_proactive_message(user_data, chat_history)
-                
-                print(f"MESSAGE: {message}")
-                
-                if message:
-                    # Send message in background to avoid timeout
-                    background_tasks.add_task(bot.send_message, telegram_id, message)
-                    # Store bot's message in chat history
-                    background_tasks.add_task(
-                        store_chat_message, 
-                        telegram_id, 
-                        "assistant", 
-                        message
-                    )
-        
+            # Get today's health data from Firestore subcollection
+            daily_data = get_daily_health_data_from_firestore(telegram_id, today_str)
+            
+            # Convert that raw daily_data into a short summary
+            health_summary = summarize_daily_health_data(daily_data)
+
+            # Pass user_data, chat_history, AND the health_summary
+            message = generate_proactive_message(user_data, chat_history, health_summary)
+            print(f"MESSAGE: {message}")
+
+            if message:
+                # Send message in background to avoid timeout
+                background_tasks.add_task(bot.send_message, telegram_id, message)
+                # Store bot's message in chat history
+                background_tasks.add_task(
+                    store_chat_message, 
+                    telegram_id, 
+                    "assistant", 
+                    message
+                )
+
         return {"status": "success", "message": "Proactive check completed"}
     except Exception as e:
         logging.error(f"Error in scheduled check: {e}")
         return {"status": "error", "message": str(e)}
+
 
 @app.post("/scheduled/update-health-data")
 async def scheduled_update_health_data():
@@ -549,7 +538,7 @@ async def whoop_callback(request: Request):
         # Notify user
         bot.send_message(
             telegram_id,
-            "Your WHOOP account is now linked! You can use /sleep to view your sleep data.",
+            "Your WHOOP account is now linked!",
         )
 
         return {"message": "WHOOP authorization successful! You can close this page."}
@@ -563,64 +552,70 @@ def root():
 
 # (6) HELPER FUNCTIONS
 
-def should_send_message(chat_history: List[Dict]) -> bool:
-    """Determines if it's appropriate to send a proactive message"""
-    if not chat_history:
-        return True
-        
-    last_message = chat_history[-1]
-    last_timestamp = datetime.datetime.fromisoformat(last_message['timestamp'])
-    # Convert utcnow to timezone-aware datetime
-    current_time = datetime.datetime.now(datetime.timezone.utc)
-    hours_since_last = (current_time - last_timestamp).total_seconds() / 3600
-    
-    # Don't message if less than 4 hours have passed
-    if hours_since_last < 4:
-       return False
-        
-    # Don't message during typical sleeping hours (11 PM - 6 AM local time)
-    current_hour = datetime.datetime.now().hour
-    if current_hour >= 22 or current_hour < 7:
-        return False
-    
-    # Analyze recent chat history for user sentiment
-    recent_messages = chat_history[-5:]  # Look at last 5 messages
-    context = "\n".join([
-        f"{msg['role']}: {msg['content']}" 
-        for msg in recent_messages
-    ])
-    
-    prompt = SHOULD_SEND_MESSAGE_PROMPT.format(context=context)
-    
-    try:
-        response = model.generate_content(prompt)
-        should_message = response.text.strip().lower() == "yes"
-        print(f"Should message: {response.text}")
-        return should_message
-    except Exception as e:
-        logging.error(f"Error analyzing chat sentiment: {e}")
-        return False
+def summarize_daily_health_data(daily_data: dict) -> str:
+    """
+    Takes the daily_data dictionary (with sleep_records, recovery_records, workout_records)
+    and returns a short string summary for prompting.
+    """
+    summary_parts = []
 
-def generate_proactive_message(user_data: dict, chat_history: List[Dict]) -> Optional[str]:
+    # --- Sleep ---
+    sleep_records = daily_data.get("sleep_records", [])
+    if sleep_records:
+        entry = sleep_records[0]  # or loop if you prefer
+        stage_summary = entry["score"]["stage_summary"]
+        slow_wave = stage_summary["total_slow_wave_sleep_time_milli"]
+        rem = stage_summary["total_rem_sleep_time_milli"]
+        summary_parts.append(
+            f"SWS: {millis_to_hhmm(slow_wave)}, REM: {millis_to_hhmm(rem)}"
+        )
+    else:
+        summary_parts.append("No sleep data")
+
+    # --- Recovery ---
+    recovery_records = daily_data.get("recovery_records", [])
+    if recovery_records:
+        recovery_score = recovery_records[0]["score"]["recovery_score"]
+        summary_parts.append(f"Recovery: {recovery_score}")
+    else:
+        summary_parts.append("No recovery data")
+
+    # --- Workout ---
+    workout_records = daily_data.get("workout_records", [])
+    if workout_records:
+        strain = workout_records[0]["score"]["strain"]
+        summary_parts.append(f"Strain: {strain}")
+    else:
+        summary_parts.append("No workout data")
+
+    return " | ".join(summary_parts)
+
+def generate_proactive_message(
+    user_data: dict, 
+    chat_history: List[Dict], 
+    health_summary: str  # <-- now we receive a processed summary
+) -> Optional[str]:
     """
-    Generates a contextual message based on user's data and chat history
+    Generates a contextual message based on user's name, processed health data, and chat history
     """
-    health_data = user_data.get('health_data', {})
+    # Safely get the user's name
     user_name = user_data.get('name', 'User')
-    
+
+    # Build the system prompt using the summary we created
     prompt = SYSTEM_INSTRUCTIONS.format(
         user_name=user_name,
-        health_data=health_data.get('sleep_data', 'No data'),
-        chat_history=chat_history[-3:] if chat_history else 'No history',
+        health_data=health_summary or "No data",  # fallback
+        chat_history=chat_history[-3:] if chat_history else "No history",
         current_message=""
     )
-    
+
     try:
         response = model.generate_content(prompt)
-        return response.text if response.text else None
+        return response.text.strip() if response and response.text else None
     except Exception as e:
         logging.error(f"Error generating proactive message: {e}")
         return None
+
 
 def convert_markdown_to_html(text: str) -> str:
     """Convert markdown-style formatting to HTML tags."""
@@ -774,7 +769,7 @@ def update_daily_health_data(telegram_id: str, date_str: str) -> None:
 
     # 2) Prepare data to store
     # You can store raw records or parse them. 
-    # For an example, we’ll just store them as-is plus a timestamp.
+    # For an example, we'll just store them as-is plus a timestamp.
     data_to_store = {
         "sleep_records": sleep_records,
         "recovery_records": recovery_records,

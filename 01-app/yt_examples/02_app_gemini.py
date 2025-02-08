@@ -15,8 +15,6 @@ SYSTEM_PROMPT = "You are a helpful Telegram bot assistant. Provide clear and con
 @bot.message_handler(func=lambda message: True)
 def handle_chat(message):
     user_text = message.text
-    
-    # Combine system prompt with user message
     full_prompt = f"{SYSTEM_PROMPT}\n\nUser: {user_text}"
 
     try:
@@ -33,3 +31,7 @@ def handle_chat(message):
 
 if __name__ == "__main__":
     bot.infinity_polling()
+
+
+
+

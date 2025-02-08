@@ -26,6 +26,12 @@ variable "whoop_client_secret" {
   sensitive   = true
 }
 
+variable "gemini_api_key" {
+  description = "Google Gemini API Key"
+  type        = string
+  sensitive   = true
+}
+
 variable "container_image" {
   description = "The container image to deploy"
   type        = string

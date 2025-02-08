@@ -79,27 +79,6 @@ Available Context:
 - Recent Interactions: {chat_history}
 """
 
-SHOULD_SEND_MESSAGE_PROMPT = """
-As an advanced health-focused AI, analyze this chat history to determine if sending a proactive health message would be beneficial.
-Return only "yes" or "no" based on these criteria:
-
-Engagement Factors:
-1. User Receptiveness: Has the user been responsive to health advice?
-2. Trust Building: Would a message now strengthen or weaken our authority?
-3. Timing: Is this an good moment for health intervention?
-
-Red Flags (Return "no" if any are true):
-- User expressed being overwhelmed or busy
-- Recent frustration with message frequency
-- Explicit request for space
-- Signs of message fatigue
-
-Recent chat history:
-{context}
-
-Decision (yes/no):
-"""
-
 HEALTH_REPORT_PROMPT = """
 You are a health and fitness assistant with access to WHOOP data. 
 A user is asking for a health report for {date_str}.
