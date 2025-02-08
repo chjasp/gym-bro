@@ -26,10 +26,15 @@ variable "whoop_client_secret" {
   sensitive   = true
 }
 
-variable "gemini_api_key" {
-  description = "Google Gemini API Key"
+  variable "gemini_api_key" {
+    description = "Google Gemini API Key"
+    type        = string
+    sensitive   = true
+  }
+
+variable "gemini_model_name" {
+  description = "Google Gemini Model Name"
   type        = string
-  sensitive   = true
 }
 
 variable "container_image" {

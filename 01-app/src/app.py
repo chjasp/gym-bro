@@ -39,6 +39,7 @@ URL = os.environ.get("URL")
 WHOOP_CLIENT_ID = os.environ.get("WHOOP_CLIENT_ID")
 WHOOP_CLIENT_SECRET = os.environ.get("WHOOP_CLIENT_SECRET")
 BOT_MODE = os.environ.get("BOT_MODE", "webhook")
+GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL_NAME")
 
 logging.basicConfig(level=logging.INFO)
 genai.configure(api_key=os.environ["GEMINI_API_KEY"])
@@ -61,7 +62,7 @@ async def lifespan(app: FastAPI):
         }
 
         model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash-thinking-exp-01-21",
+            model_name=GEMINI_MODEL_NAME,
             generation_config=generation_config,
         )
         logging.info("Vertex AI model initialized")

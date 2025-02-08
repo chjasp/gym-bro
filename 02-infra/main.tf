@@ -22,7 +22,7 @@ resource "google_project_iam_member" "ai_platform_predict" {
 # Cloud Run service
 resource "google_cloud_run_service" "app" {
   project  = var.project_id
-  name     = "bryan-botson" # var.service_name
+  name     = var.service_name
   location = var.region
 
   template {
@@ -73,6 +73,11 @@ resource "google_cloud_run_service" "app" {
           name  = "GEMINI_API_KEY"
           value = var.gemini_api_key
         }
+
+        env {
+          name  = "GEMINI_MODEL_NAME"
+          value = var.gemini_model_name
+        }
       }
     }
   }
@@ -96,7 +101,7 @@ resource "google_cloud_scheduler_job" "check_in_job" {
   region           = var.region
   name             = "periodic-check-in-trigger"
   description      = "Triggers check-in messages every 5 hours"
-  schedule         = "0 8,18 * * *"
+  schedule         = "0 12 * * *"
   time_zone        = "Europe/Berlin"
   attempt_deadline = "320s"
 
